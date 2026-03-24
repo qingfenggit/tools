@@ -1,240 +1,223 @@
 #!/usr/bin/env bash
+# 仅使用 sing-box 内核安装 tuic 节点 (适配 Alpine / Debian / Ubuntu / CentOS)
 
-set -euo pipefail
+set -eo pipefail
 
-#================ 基本配置 ================
-TUIC_VERSION="v1.0.0"                # tuic 服务端版本，可按需修改
-TUIC_BIN_DIR="/usr/local/bin"
-TUIC_BIN="${TUIC_BIN_DIR}/tuic-server"
-TUIC_CONF_DIR="/etc/tuic"
-TUIC_CONF_FILE="${TUIC_CONF_DIR}/config.json"
-TUIC_SERVICE_FILE="/etc/systemd/system/tuic.service"
+WORK_DIR="/etc/sing-box"
+CONF_FILE="$WORK_DIR/config.json"
+BIN_FILE="/usr/local/bin/sing-box"
 
-# 默认参数（可通过交互覆盖）
 SERVER_IP=""
 TUIC_PORT=4443
-TUIC_UUID=""                         # 自动生成
-TUIC_PASSWORD=""                     # 自动生成
-TUIC_CONGESTION_CONTROL="bbr"        # bbr / cubic / new_reno …
-TLS_SERVER="addons.mozilla.org"      # SNI
+TUIC_UUID=""
+TUIC_PASSWORD=""
+TLS_SERVER="addons.mozilla.org"
+FINGERPRINT=""
 
-SELF_SIGNED_CERT=""
-SELF_SIGNED_KEY=""
+log() { echo -e "\033[32m[INFO]\033[0m $1"; }
+err() { echo -e "\033[31m[ERROR]\033[0m $1" >&2; exit 1; }
 
-#================ 工具函数 ================
-log()  { echo -e "\033[32m[INFO]\033[0m $*"; }
-err()  { echo -e "\033[31m[ERROR]\033[0m $*" >&2; exit 1; }
-ask()  { read -rp "$1" "$2"; }
-
-check_root() {
-  [[ $EUID -ne 0 ]] && err "请用 root 运行：sudo -i 后再执行该脚本"
-}
-
-detect_os() {
-  if [ -f /etc/os-release ]; then
-    . /etc/os-release
-    OS=$ID
-  else
-    err "无法检测系统类型"
-  fi
+check_root() { 
+  if [ "$(id -u)" != "0" ]; then 
+    err "请使用 root 执行"
+  fi 
 }
 
 install_deps() {
   log "安装依赖..."
-  case "$OS" in
-    debian|ubuntu)
-      apt-get update -y
-      apt-get install -y wget curl jq openssl
-      ;;
-    centos|rocky|almalinux)
-      yum install -y epel-release
-      yum install -y wget curl jq openssl
-      ;;
-    fedora)
-      dnf install -y wget curl jq openssl
-      ;;
-    alpine)
-      apk add --no-cache wget curl jq openssl
-      ;;
-    arch)
-      pacman -Sy --noconfirm wget curl jq openssl
-      ;;
-    *)
-      err "暂不支持的系统：$OS"
-      ;;
-  esac
-}
-
-download_tuic() {
-  mkdir -p "$TUIC_BIN_DIR"
-  ARCH=$(uname -m)
-  case "$ARCH" in
-    x86_64|amd64)  ARCH_TAG="x86_64-unknown-linux-gnu" ;;
-    aarch64|arm64) ARCH_TAG="aarch64-unknown-linux-gnu" ;;
-    *)
-      err "暂不支持的架构：$ARCH"
-      ;;
-  esac
-
-  local URL="https://github.com/EAimTY/tuic/releases/download/${TUIC_VERSION}/tuic-server-${ARCH_TAG}"
-  log "下载 tuic 服务端：$URL"
-  wget -O "$TUIC_BIN" "$URL"
-  chmod +x "$TUIC_BIN"
-}
-
-gen_cert() {
-  mkdir -p "$TUIC_CONF_DIR"
-  SELF_SIGNED_CERT="${TUIC_CONF_DIR}/tuic.crt"
-  SELF_SIGNED_KEY="${TUIC_CONF_DIR}/tuic.key"
-
-  log "生成自签证书..."
-  openssl req -x509 -newkey rsa:2048 -nodes \
-    -keyout "$SELF_SIGNED_KEY" \
-    -out "$SELF_SIGNED_CERT" \
-    -days 3650 \
-    -subj "/CN=${TLS_SERVER}"
-}
-
-gen_uuid_and_password() {
-  if [ -z "$TUIC_UUID" ]; then
-    TUIC_UUID=$(cat /proc/sys/kernel/random/uuid)
-  fi
-
-  if [ -z "$TUIC_PASSWORD" ]; then
-    TUIC_PASSWORD=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)
+  if [ -f /etc/alpine-release ]; then
+    apk update && apk add --no-cache curl openssl jq tar bash
+  elif [ -f /etc/debian_version ]; then
+    apt-get update && apt-get install -y curl openssl jq tar bash
+  elif [ -f /etc/redhat-release ]; then
+    yum install -y curl openssl jq tar bash
+  else
+    err "不支持的系统"
   fi
 }
 
 input_params() {
-  local WAN4 WAN6 TMP_PORT TMP_CC TMP_SNI
-  WAN4=$(curl -4s https://ip.gs || true)
-  WAN6=$(curl -6s https://ip.gs || true)
+  local ip
+  ip=$(curl -sL https://ipinfo.io/ip || echo "")
+  read -p "请输入服务器IP [默认 $ip]: " SERVER_IP
+  SERVER_IP=${SERVER_IP:-$ip}
 
-  log "检测到 IPv4: ${WAN4:-无}, IPv6: ${WAN6:-无}"
-  ask "请输入服务器 IP [默认: ${WAN4:-$WAN6}]: " SERVER_IP
-  SERVER_IP=${SERVER_IP:-${WAN4:-$WAN6}}
-  [ -z "$SERVER_IP" ] && err "服务器 IP 不能为空"
+  read -p "请输入端口 [默认 $TUIC_PORT]: " port
+  TUIC_PORT=${port:-$TUIC_PORT}
 
-  ask "请输入 tuic 监听端口 [默认: $TUIC_PORT]: " TMP_PORT
-  TUIC_PORT=${TMP_PORT:-$TUIC_PORT}
-
-  ask "拥塞控制算法 [默认: $TUIC_CONGESTION_CONTROL]: " TMP_CC
-  TUIC_CONGESTION_CONTROL=${TMP_CC:-$TUIC_CONGESTION_CONTROL}
-
-  ask "TLS server_name / SNI [默认: $TLS_SERVER]: " TMP_SNI
-  TLS_SERVER=${TMP_SNI:-$TLS_SERVER}
-
-  gen_uuid_and_password
-  log "自动生成 UUID : $TUIC_UUID"
-  log "自动生成 PASS : $TUIC_PASSWORD"
+  # 兼容所有系统的 UUID 生成
+  TUIC_UUID=$(openssl rand -hex 16 | sed 's/\(........\)\(....\)\(....\)\(....\)\(............\)/\1-\2-\3-\4-\5/')
+  TUIC_PASSWORD=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9' | head -c 12)
+  
+  log "生成的 UUID: $TUIC_UUID"
+  log "生成的 PASS: $TUIC_PASSWORD"
 }
 
-write_config() {
-  log "生成 tuic 配置: $TUIC_CONF_FILE"
-  cat > "$TUIC_CONF_FILE" <<EOF
+gen_cert() {
+  mkdir -p "$WORK_DIR"
+  log "生成自签证书 (CN=$TLS_SERVER)..."
+  openssl req -x509 -newkey rsa:2048 -nodes \
+    -keyout "$WORK_DIR/tuic.key" \
+    -out "$WORK_DIR/tuic.crt" \
+    -days 3650 -subj "/CN=$TLS_SERVER" 2>/dev/null
+  
+  # 最兼容的 SHA256 base64 指纹提取方式
+  FINGERPRINT=$(openssl x509 -in "$WORK_DIR/tuic.crt" -noout -pubkey | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -binary | openssl enc -base64)
+}
+
+download_singbox() {
+  log "获取 sing-box 最新稳定版版本号..."
+  
+  # 使用 curl + jq 获取最新 release，这是最严谨的做法
+  LATEST_VERSION=$(curl -sL https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r '.tag_name' | sed 's/^v//')
+  
+  if [ -z "$LATEST_VERSION" ] || [ "$LATEST_VERSION" = "null" ]; then
+    err "无法获取最新版本号，请检查网络或 Github API 限制。"
+  fi
+  log "当前最新版本: v${LATEST_VERSION}"
+
+  ARCH=$(uname -m)
+  case "$ARCH" in
+    x86_64) SB_ARCH="amd64" ;;
+    aarch64) SB_ARCH="arm64" ;;
+    *) err "不支持架构: $ARCH" ;;
+  esac
+  
+  DOWNLOAD_URL="https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VERSION}/sing-box-${LATEST_VERSION}-linux-${SB_ARCH}.tar.gz"
+  log "下载 sing-box: $DOWNLOAD_URL"
+  
+  # 必须使用 curl -L 支持重定向，避免下载到无效文件导致 tar 报错
+  curl -sL -o /tmp/sb.tar.gz "$DOWNLOAD_URL"
+  
+  tar -xzf /tmp/sb.tar.gz -C /tmp
+  cp /tmp/sing-box-${LATEST_VERSION}-linux-${SB_ARCH}/sing-box "$BIN_FILE"
+  chmod +x "$BIN_FILE"
+  rm -rf /tmp/sing-box-* /tmp/sb.tar.gz
+}
+
+gen_server_config() {
+  log "生成 sing-box 服务端配置..."
+  cat > "$CONF_FILE" <<EOF
 {
-  "server": "${SERVER_IP}",
-  "server_port": ${TUIC_PORT},
-  "users": [
+  "log": {
+    "level": "info"
+  },
+  "inbounds": [
     {
-      "uuid": "${TUIC_UUID}",
-      "password": "${TUIC_PASSWORD}"
+      "type": "tuic",
+      "tag": "tuic-in",
+      "listen": "::",
+      "listen_port": $TUIC_PORT,
+      "users": [
+        {
+          "uuid": "$TUIC_UUID",
+          "password": "$TUIC_PASSWORD"
+        }
+      ],
+      "congestion_control": "bbr",
+      "tls": {
+        "enabled": true,
+        "alpn": ["h3"],
+        "certificate_path": "$WORK_DIR/tuic.crt",
+        "key_path": "$WORK_DIR/tuic.key"
+      }
     }
   ],
-  "congestion_control": "${TUIC_CONGESTION_CONTROL}",
-  "alpn": ["h3"],
-  "max_idle_time": "30s",
-  "log_level": "info",
-  "certificate": "${SELF_SIGNED_CERT}",
-  "private_key": "${SELF_SIGNED_KEY}",
-  "enable_0rtt": false
+  "outbounds": [
+    {
+      "type": "direct"
+    }
+  ]
 }
 EOF
 }
 
-write_service() {
-  log "写入 systemd 服务: $TUIC_SERVICE_FILE"
-  cat > "$TUIC_SERVICE_FILE" <<EOF
+install_service() {
+  log "配置系统服务..."
+  if command -v systemctl >/dev/null 2>&1; then
+    cat > /etc/systemd/system/sing-box.service <<EOF
 [Unit]
-Description=TUIC Server
+Description=sing-box service
 After=network.target
 
 [Service]
-Type=simple
-ExecStart=${TUIC_BIN} -c ${TUIC_CONF_FILE}
+ExecStart=$BIN_FILE run -c $CONF_FILE
 Restart=on-failure
-RestartSec=5
 User=root
 LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
-  systemctl daemon-reload
-  systemctl enable --now tuic.service
-}
-
-gen_v2rayn_link() {
-  local NAME="tuic-${SERVER_IP}-${TUIC_PORT}"
-  local RAW="tuic://${TUIC_UUID}:${TUIC_PASSWORD}@${SERVER_IP}:${TUIC_PORT}?sni=${TLS_SERVER}&alpn=h3&allowInsecure=1&congestion_control=${TUIC_CONGESTION_CONTROL}#${NAME}"
-  echo "$RAW"
-}
-
-gen_clash_snippet() {
-  local NAME="tuic-${SERVER_IP}-${TUIC_PORT}"
-  cat <<EOF
-- name: "${NAME}"
-  type: tuic
-  server: ${SERVER_IP}
-  port: ${TUIC_PORT}
-  uuid: ${TUIC_UUID}
-  password: ${TUIC_PASSWORD}
-  alpn:
-    - h3
-  reduce-rtt: true
-  request-timeout: 8000
-  udp-relay-mode: native
-  congestion-controller: ${TUIC_CONGESTION_CONTROL}
-  sni: ${TLS_SERVER}
-  skip-cert-verify: false
+    systemctl daemon-reload
+    systemctl enable --now sing-box
+    log "服务已通过 systemctl 启动"
+  elif [ -f /sbin/openrc-run ]; then
+    cat > /etc/init.d/sing-box <<EOF
+#!/sbin/openrc-run
+command="$BIN_FILE"
+command_args="run -c $CONF_FILE"
+command_background=yes
+pidfile="/run/sing-box.pid"
+depend() { need net; }
 EOF
+    chmod +x /etc/init.d/sing-box
+    rc-update add sing-box default
+    rc-service sing-box start
+    log "服务已通过 openrc 启动"
+  else
+    log "未检测到 systemd 或 openrc，请手动后台运行: $BIN_FILE run -c $CONF_FILE"
+  fi
 }
 
-show_info() {
-  log "tuic 安装完成！"
+show_client_info() {
+  local V2RAYN_LINK="tuic://${TUIC_UUID}:${TUIC_PASSWORD}@${SERVER_IP}:${TUIC_PORT}?sni=${TLS_SERVER}&alpn=h3&allowInsecure=1&congestion_control=bbr#tuic-node"
+
   echo
-  echo "=========== tuic 节点信息 ==========="
-  echo "服务器 IP      : ${SERVER_IP}"
-  echo "端口           : ${TUIC_PORT}"
-  echo "UUID           : ${TUIC_UUID}"
-  echo "Password       : ${TUIC_PASSWORD}"
-  echo "SNI            : ${TLS_SERVER}"
-  echo "Congestion Ctl : ${TUIC_CONGESTION_CONTROL}"
-  echo "证书路径       : ${SELF_SIGNED_CERT}"
-  echo "私钥路径       : ${SELF_SIGNED_KEY}"
-  echo "===================================="
+  echo -e "\033[32m=============== 安装完成 =================\033[0m"
+  echo "服务端地址 : $SERVER_IP"
+  echo "端口       : $TUIC_PORT"
+  echo "UUID       : $TUIC_UUID"
+  echo "Password   : $TUIC_PASSWORD"
+  echo "SNI        : $TLS_SERVER"
+  echo "sing-box   : v${LATEST_VERSION}"
+  echo -e "\033[32m==========================================\033[0m"
   echo
-  echo "=========== V2Ray / V2RayN 链接 ==========="
-  gen_v2rayn_link
-  echo "==========================================="
+  echo ">>> [v2rayN / Nekobox 链接]"
+  echo -e "\033[36m${V2RAYN_LINK}\033[0m"
   echo
-  echo "=========== Clash 节点片段 ================"
-  gen_clash_snippet
-  echo "（复制以上到 Clash 的 proxies 列表中）"
-  echo "==========================================="
+  echo ">>> [客户端 sing-box Outbound 配置]"
+  cat <<EOF
+{
+  "type": "tuic",
+  "tag": "tuic-out",
+  "server": "$SERVER_IP",
+  "server_port": $TUIC_PORT,
+  "uuid": "$TUIC_UUID",
+  "password": "$TUIC_PASSWORD",
+  "congestion_control": "bbr",
+  "udp_relay_mode": "native",
+  "zero_rtt_handshake": false,
+  "heartbeat": "10s",
+  "tls": {
+    "enabled": true,
+    "server_name": "$TLS_SERVER",
+    "certificate_public_key_sha256": ["$FINGERPRINT"],
+    "alpn": ["h3"]
+  }
+}
+EOF
 }
 
 main() {
   check_root
-  detect_os
   install_deps
-  download_tuic
   input_params
   gen_cert
-  write_config
-  write_service
-  show_info
+  download_singbox
+  gen_server_config
+  install_service
+  show_client_info
 }
 
-main "\$@"
+main
