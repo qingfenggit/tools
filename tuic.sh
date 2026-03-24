@@ -26,7 +26,7 @@ check_root() {
 install_deps() {
   log "安装依赖..."
   if [ -f /etc/alpine-release ]; then
-    apk update && apk add --no-cache curl openssl jq tar bash
+    apk update && apk add --no-cache curl openssl jq tar bash gcompat libstdc++
   elif [ -f /etc/debian_version ]; then
     apt-get update && apt-get install -y curl openssl jq tar bash
   elif [ -f /etc/redhat-release ]; then
