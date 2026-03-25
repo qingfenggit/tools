@@ -171,7 +171,7 @@ EOF
 }
 
 show_client_info() {
-  local V2RAYN_LINK="tuic://${TUIC_UUID}:${TUIC_PASSWORD}@${SERVER_IP}:${TUIC_PORT}?sni=${TLS_SERVER}&alpn=h3&allowInsecure=1&congestion_control=bbr#tuic-node"
+  local V2RAYN_LINK="tuic://${TUIC_UUID}:${TUIC_PASSWORD}@${SERVER_IP}:${TUIC_PORT}?sni=${TLS_SERVER}&alpn=h3&insecure=1&allowInsecure=1&congestion_control=bbr#tuic-node"
 
   echo
   echo -e "\033[32m=============== 安装完成 =================\033[0m"
